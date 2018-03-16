@@ -6,6 +6,9 @@ precision highp float;
 
 const float PI = 3.14159265;
 
+#ifdef GL_ES
+precision mediump float;
+#endif
 uniform sampler2D tData;
 uniform vec2 resolution;
 uniform float velocityMax;
