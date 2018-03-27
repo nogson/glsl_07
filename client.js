@@ -9,7 +9,7 @@ const simulationVertex = glslify('./src/js/shaders/simulation/vertexShader.vert'
 const simulationFragment = glslify('./src/js/shaders/simulation/fragmentShader.frag');
 
 const CAMERA_DEPTH = 1024;
-const PARTICLE_COUNT = Math.pow(2, 20);
+const PARTICLE_COUNT = Math.pow(2, 14);
 const PARTICLE_TEXTURE_SIZE = Math.sqrt(PARTICLE_COUNT);
 
 let time = 0.0;
