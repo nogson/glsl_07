@@ -1,232 +1,302 @@
-global.THREE = require('three');
-const createBackground = require('three-vignette-background');
-const Stats = require('stats.js');
+// global.THREE = require('three');
+
+// const Stats = require('stats.js');
 const glslify = require('glslify');
+const createBackground = require('three-vignette-background');
 
-const particlesVertex = glslify('./src/js/shaders/particles/vertexShader.vert');
-const particlesFragment = glslify('./src/js/shaders/particles/fragmentShader.frag');
-const simulationVertex = glslify('./src/js/shaders/simulation/vertexShader.vert');
-const simulationFragment = glslify('./src/js/shaders/simulation/fragmentShader.frag');
 
-const CAMERA_DEPTH = 1024;
-const PARTICLE_COUNT = Math.pow(2, 14);
-const PARTICLE_TEXTURE_SIZE = Math.sqrt(PARTICLE_COUNT);
+const computeShaderVelocity = glslify('./src/js/shaders/computeShaderVelocity.frag');
+const computeShaderPosition = glslify('./src/js/shaders/computeShaderPosition.frag');
+const computeShaderReset = glslify('./src/js/shaders/restShader.frag');
+const particleVertexShader = glslify('./src/js/shaders/particleVertexShader.vert');
+const particleFragmentShader = glslify('./src/js/shaders/particleFragmentShader.frag');
 
-let time = 0.0;
 
-if (!THREE.Math.isPowerOfTwo(PARTICLE_TEXTURE_SIZE)) {
-  throw new Error('Particle count should be a power of two.');
+if (!Detector.webgl) Detector.addGetWebGLMessage();
+// 今回は25万パーティクルを動かすことに挑戦
+// なので1辺が500のテクスチャを作る。
+// 500 * 500 = 250000
+const WIDTH = 50;
+const PARTICLES = WIDTH * WIDTH;
+const CLOCK = new THREE.Clock();
+
+
+// メモリ負荷確認用
+let stats;
+
+// 基本セット
+let container, camera, scene, renderer, geometry, controls;
+
+// gpgpuをするために必要なオブジェクト達
+let gpuCompute;
+let velocityVariable;
+let positionVariable;
+let restVariable;
+let positionUniforms;
+let velocityUniforms;
+let particleUniforms;
+let effectController;
+let time;
+let mouse;
+
+init();
+animate();
+
+function init() {
+
+
+  // 一般的なThree.jsにおける定義部分
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 15000);
+  camera.position.y = 1;
+  camera.position.z = -3;
+  scene = new THREE.Scene();
+  renderer = new THREE.WebGLRenderer();
+  renderer.setClearColor(0xFFFFFF);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  container.appendChild(renderer.domElement);
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  stats = new Stats();
+  container.appendChild(stats.dom);
+  window.addEventListener('resize', onWindowResize, false);
+
+  let background = createBackground({
+    noiseAlpha: 0.1,
+    colors: ['#FFFFFF', '#999999']
+  });
+  scene.add(background)
+
+  //その他の初期値
+  time = 0;
+  mouse = new THREE.Vector2();
+
+  // ①gpuCopute用のRenderを作る
+  initComputeRenderer();
+
+  // ②particle 初期化
+  initPosition();
+
 }
 
-const RESOLUTION = new THREE.Vector2(
-  window.innerWidth,
-  window.innerHeight
-);
 
-const RESOLUTION_HALF = RESOLUTION.clone().multiplyScalar(0.5);
+// ①gpuCopute用のRenderを作る
+function initComputeRenderer() {
 
+  // gpgpuオブジェクトのインスタンスを格納
+  gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
 
-
-//基本設定
-const renderer = new THREE.WebGLRenderer();
-const scene = new THREE.Scene()
-
-const camera = new THREE.OrthographicCamera(
-  RESOLUTION_HALF.x * -1, //left 視線のどれぐらい左まで画面に入れるか。 
-  RESOLUTION_HALF.x, //right 視線のどれぐらい右まで画面に入れるか。 
-  RESOLUTION_HALF.y, //top 視線のどれぐらい上まで画面に入れるか。
-  RESOLUTION_HALF.y * -1, //bottom 視線のどれぐらい下まで画面に入れるか。 
-  1, //near
-  CAMERA_DEPTH //far
-);
-camera.position.z = CAMERA_DEPTH / 2;
-
-const body = document.getElementsByTagName('body')[0];
-
-//renderer.setClearColorはしない
-renderer.setPixelRatio(window.devicePixelRatio || 1);
-renderer.setSize(RESOLUTION.x, RESOLUTION.y);
-
-// canvasをbodyに追加
-body.appendChild(renderer.domElement);
+  // 今回はパーティクルの位置情報と、移動方向を保存するテクスチャを2つ用意します
+  // new THREE.DataTextureを作ってる
+  let dtPosition = gpuCompute.createTexture();
+  let dtVelocity = gpuCompute.createTexture();
 
 
-function getParticleData(particleCount, textureSize) {
-  const data = new Float32Array(particleCount * 4);
+  // テクスチャにGPUで計算するために初期情報を埋めていく
+  fillTextures(dtPosition, dtVelocity);
 
-  for (let i = 0; i < data.length; i += 4) {
-    const position = new THREE.Vector2(
-      Math.random() - 0.5,
-      Math.random() - 0.5
-    );
+  // shaderプログラムのアタッチ
+  velocityVariable = gpuCompute.addVariable("textureVelocity", computeShaderVelocity, dtVelocity);
+  positionVariable = gpuCompute.addVariable("texturePosition", computeShaderPosition, dtPosition);
 
-    data[i + 0] = position.x;
-    data[i + 1] = position.y;
-  }
-
-  const texture = new THREE.DataTexture(
-    data, textureSize, textureSize,
-    THREE.RGBAFormat,
-    THREE.FloatType,
-    THREE.Texture.DEFAULT_MAPPING,
-    THREE.RepeatWrapping,
-    THREE.RepeatWrapping,
-    THREE.NearestFilter,
-    THREE.NearestFilter
-  );
-
-  texture.needsUpdate = true;
-
-  return texture;
-}
-
-
-var renderTarget = new THREE.WebGLRenderTarget(
-  PARTICLE_TEXTURE_SIZE,
-  PARTICLE_TEXTURE_SIZE, {
-    minFilter: THREE.NearestFilter,
-    magFilter: THREE.NearestFilter,
-    type: THREE.FloatType,
-    stencilBuffer: false,//ステンシルバッファをOFF
-  }
-);
-
-const textureBuffers = new(function () {
-  this.in = renderTarget;
-  this.out = renderTarget.clone();
-
-  this.swap = () => {
-    [this.in, this.out] = [this.out, this.in];
+  //uniform変数を追加
+  positionUniforms = positionVariable.material.uniforms;
+  velocityUniforms = velocityVariable.material.uniforms;
+  velocityUniforms.time = {
+    value: time
   };
-});
+  positionUniforms.mouse = {
+    value: mouse
+  };
+
+  positionUniforms.time = {
+    value: time
+  };
 
 
+  // 一連の関係性を構築するためのおまじない
+  gpuCompute.setVariableDependencies(velocityVariable, [positionVariable, velocityVariable]);
+  gpuCompute.setVariableDependencies(positionVariable, [positionVariable, velocityVariable]);
 
 
-const SHADER_UNIFORMS_GLOBAL = {
-  tData: {
-    type: 't',
-    value: getParticleData(PARTICLE_COUNT, PARTICLE_TEXTURE_SIZE)
-  },
-  resolution: {
-    type: 'v2',
-    value: RESOLUTION,
-  },
-  velocityMax: {
-    type: 'f',
-    value: Math.min(
-      RESOLUTION.x,
-      RESOLUTION.y
-    ) * 0.125
-  },
-  colorBase: {
-    type: 'c',
-    value: new THREE.Color('hsl(245, 100%, 30%)'),
-  },
-  colorIntense: {
-    type: 'c',
-    value: new THREE.Color('hsl(15, 100%, 30%)'),
-  },
-  time: {
-    type: 'f',
-    value: 0,
-  },
-  delta: {
-    type: 'f',
-    value: 0,
+  // error処理
+  let error = gpuCompute.init();
+  if (error !== null) {
+    console.error(error);
   }
-};
-
-const rttScene = new THREE.Scene();
-const rttGeometry = new THREE.PlaneGeometry(RESOLUTION.x, RESOLUTION.y, 1, 1);
-
-const rttMaterial = new THREE.ShaderMaterial({
-  uniforms: SHADER_UNIFORMS_GLOBAL,
-  vertexShader: simulationVertex,
-  fragmentShader: simulationFragment,
-});
-
-const rttPlane = new THREE.Mesh(rttGeometry, rttMaterial);
-rttScene.add(rttPlane);
-renderer.render(rttScene, camera, textureBuffers.out, true);
-
-/**
- * Mutate and render GPU texture
- */
-
-const vertices = new Float32Array(PARTICLE_COUNT * 3);
-
-
-for (let i = 0; i < vertices.length; i++) {
-  vertices[i] = 0;
 }
 
-const uvs = new Float32Array(PARTICLE_COUNT * 2);
 
-for (let i = 0; i < uvs.length; i += 2) {
-  const index = i / 2;
-  uvs[i + 0] = (index % PARTICLE_TEXTURE_SIZE) / PARTICLE_TEXTURE_SIZE;
-  uvs[i + 1] = Math.floor(index / PARTICLE_TEXTURE_SIZE) / PARTICLE_TEXTURE_SIZE;
-}
+// ②パーティクルそのものの情報を決めていく。
+function initPosition() {
 
-const particleGeometry = new THREE.BufferGeometry();
-particleGeometry.addAttribute(
-  'position',
-  new THREE.BufferAttribute(vertices, 3)
-);
-particleGeometry.addAttribute(
-  'uv', 
-  new THREE.BufferAttribute(uvs, 2)
-);
+  // 最終的に計算された結果を反映するためのオブジェクト。
+  // 位置情報はShader側(texturePosition, textureVelocity)
+  // で決定されるので、以下のように適当にうめちゃってOK
 
-const particleMaterial = new THREE.ShaderMaterial({
-  uniforms: Object.assign({}, SHADER_UNIFORMS_GLOBAL, {
-    tData: {
-      type: 't',
-      value: textureBuffers.in
+  geometry = new THREE.BufferGeometry();
+  let positions = new Float32Array(PARTICLES * 3);
+  let p = 0;
+  for (let i = 0; i < PARTICLES; i++) {
+    positions[p++] = 0;
+    positions[p++] = 0;
+    positions[p++] = 0;
+  }
+
+  // uv情報の決定。テクスチャから情報を取り出すときに必要
+  let uvs = new Float32Array(PARTICLES * 2);
+  p = 0;
+  for (let j = 0; j < WIDTH; j++) {
+    for (let i = 0; i < WIDTH; i++) {
+      uvs[p++] = i / (WIDTH - 1);
+      uvs[p++] = j / (WIDTH - 1);
+
+    }
+  }
+
+  // attributeをgeometryに登録する
+  geometry.addAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.addAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+
+
+  // uniform変数をオブジェクトで定義
+  // 今回はカメラをマウスでいじれるように、計算に必要な情報もわたす。
+  particleUniforms = {
+    texturePosition: {
+      value: null
     },
-  }),
+    textureVelocity: {
+      value: null
+    },
+    cameraConstant: {
+      value: getCameraConstant(camera)
+    }
+  };
 
-  vertexShader: particlesVertex,
-  fragmentShader: particlesFragment,
-  depthTest: false,
-  transparent: true,
-  blending: THREE.AdditiveBlending,
-})
 
 
-const particles = new THREE.Points(
-  particleGeometry,
-  particleMaterial
-);
+  // Shaderマテリアル これはパーティクルそのものの描写に必要なシェーダー
+  let material = new THREE.ShaderMaterial({
+    uniforms: particleUniforms,
+    vertexShader: particleVertexShader,
+    fragmentShader: particleFragmentShader
+  });
+  //material.extensions.drawBuffers = true;
+  let particles = new THREE.Points(geometry, material);
+  particles.matrixAutoUpdate = false;
+  //particles.updateMatrix();
 
-scene.add(particles);
+  // パーティクルをシーンに追加
+  scene.add(particles);
+}
 
-const start = Date.now() / 1000;
-let previous = start;
+function fillTextures(texturePosition, textureVelocity) {
 
-const render = () => {
-  requestAnimationFrame(render);
 
-  textureBuffers.swap();
+  // textureのイメージデータをいったん取り出す
+  let posArray = texturePosition.image.data;
+  let velArray = textureVelocity.image.data;
 
-  const now = Date.now() / 1000;
-  const delta = now - previous;
-  const elapsed = now - start;
+  // パーティクルの初期の位置は、ランダムなXZに平面おく。
+  // 板状の正方形が描かれる
+  let geometry = new THREE.SphereBufferGeometry(1, 32, 32);
+  let pos = geometry.attributes.position.array;
+  let pArr = [];
+  for (let p = 0, pl = pos.length; p < pl; p += 3) {
+    pArr.push([
+      pos[p + 0],
+      pos[p + 1],
+      pos[p + 2]
+    ]);
+  }
 
-  rttMaterial.uniforms.time.value = elapsed;
-  rttMaterial.uniforms.delta.value = delta;
 
-  rttMaterial.uniforms.tData.value = textureBuffers.in.texture;
-  renderer.render(rttScene, camera, textureBuffers.out, true);
+  for (let k = 0, kl = posArray.length; k < kl; k += 4) {
+    // Position
+    let x, y, z;
+    let randomPos = pArr[Math.floor(Math.random() * pArr.length)];
+    // x = Math.random() * WIDTH - WIDTH/2;
+    // z = Math.random() * WIDTH - WIDTH/2;
+    // y = 0;
+    // posArrayの実態は一次元配列なので
+    // x,y,z,wの順番に埋めていく。
+    // wは今回は使用しないが、配列の順番などを埋めておくといろいろ使えて便利
+    posArray[k + 0] = randomPos[0];
+    posArray[k + 1] = randomPos[1];
+    posArray[k + 2] = randomPos[2];
+    posArray[k + 3] = 0;
 
-  particles.material.uniforms.time.value = elapsed;
-  particles.material.uniforms.delta.value = delta;
+    // 移動する方向はとりあえずランダムに決めてみる。
+    // これでランダムな方向にとぶパーティクルが出来上がるはず。
+    velArray[k + 0] = Math.random() * 2 - 1;
+    velArray[k + 1] = Math.random() * 2 - 1;
+    velArray[k + 2] = Math.random() * 2 - 1;
+    velArray[k + 3] = Math.random() * 2 - 1;
+  }
+}
 
-  particles.material.uniforms.tData.value = textureBuffers.in.texture;
+
+
+// カメラオブジェクトからシェーダーに渡したい情報を引っ張ってくる関数
+// カメラからパーティクルがどれだけ離れてるかを計算し、パーティクルの大きさを決定するため。
+function getCameraConstant(camera) {
+  return window.innerHeight / (Math.tan(THREE.Math.DEG2RAD * 0.5 * camera.fov) / camera.zoom);
+}
+
+
+
+// 画面がリサイズされたときの処理
+// ここでもシェーダー側に情報を渡す。
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  particleUniforms.cameraConstant.value = getCameraConstant(camera);
+}
+
+
+function animate() {
+  requestAnimationFrame(animate);
+  render();
+  stats.update();
+}
+
+
+
+function render() {
+
+  // 計算用のテクスチャを更新
+  gpuCompute.compute();
+
+  //uniform変数を更新
+  time = CLOCK.getElapsedTime();
+
+  positionVariable.material.uniforms.time.value = time;
+  velocityVariable.material.uniforms.time.value = time;
+
+
+   // 計算した結果が格納されたテクスチャをレンダリング用のシェーダーに渡す
+  particleUniforms.texturePosition.value = gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+  particleUniforms.textureVelocity.value = gpuCompute.getCurrentRenderTarget(velocityVariable).texture;
   renderer.render(scene, camera);
+}
 
-  previous = now;
-};
 
-render();
+function restartSimulation() {
+  var dtPosition = gpuCompute.createTexture();
+  var dtVelocity = gpuCompute.createTexture();
+  fillTextures( dtPosition, dtVelocity,mouse );
+  gpuCompute.renderTexture( dtPosition, positionVariable.renderTargets[ 0 ] );
+  gpuCompute.renderTexture( dtPosition, positionVariable.renderTargets[ 1 ] );
+  gpuCompute.renderTexture( dtVelocity, velocityVariable.renderTargets[ 0 ] );
+  gpuCompute.renderTexture( dtVelocity, velocityVariable.renderTargets[ 1 ] );
+}
+
+
+
+window.onmousedown = function (ev) {
+  if (ev.target == renderer.domElement) {
+    restartSimulation();
+  }
+}
